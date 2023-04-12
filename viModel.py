@@ -50,9 +50,7 @@ class MeanFieldGaussianFeedForward(VIModel):
                  out_features,
                  bias=True,
                  groups=1,
-                 weight_prior_mean=0,
                  weight_prior_sigma=1,
-                 bias_prior_mean=0,
                  bias_prior_sigma=1,
                  init_mean_zero=False,
                  init_bias_mean_zero=False,
@@ -107,5 +105,92 @@ class MeanFieldGaussianFeedForward(VIModel):
     def forward(self, x, stochastic=True):
         self.sample_transform(stochastic)
         return F.linear(x, weight=self.samples['weights'], bias=self.samples['bias'] if self.has_bias else None)
+
+
+class MeanFieldGaussian2DConvolution(VIModel):
+    """
+    A Bayesian module that fit a posterior gaussian distribution on a 2D convolution module with normal prior.
+    """
+
+    def __init__(self,
+                 in_channels,
+                 out_channels,
+                 kernel_size,
+                 stride=1,
+                 padding=0,
+                 dilation=1,
+                 groups=1,
+                 bias=True,
+                 padding_mode='zeros',
+                 w_prior_sigma=1,
+                 b_prior_sigma=1,
+                 init_mean_zero=False,
+                 init_bias_mean_zero=False,
+                 init_prior_sigma_scale=0.01):
+        super(MeanFieldGaussian2DConvolution, self).__init__()
+
+        self.samples = {'weights': None, 'bias': None, 'w_noise_state': None, 'b_noise_state': None}
+
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size if isinstance(kernel_size, tuple) else (kernel_size, kernel_size)
+        self.stride = stride
+        self.padding = padding
+        self.dilation = dilation
+        self.groups = groups
+        self.has_bias = bias
+        self.padding_mode = padding_mode
+
+        self.weights_mean = Parameter((0.0 if init_mean_zero else 1.0)
+                                      * torch.rand(out_channels, in_channels // groups, *self.kernel_size) - 0.5)
+        self.log_weights_sigma = Parameter(torch.log(init_prior_sigma_scale * w_prior_sigma *
+                                                     torch.ones(out_channels, round(in_channels // groups),
+                                                                *self.kernel_size)))
+        self.noise_source_weights = Normal(torch.zeros(out_channels, in_channels // groups, *self.kernel_size),
+                                           torch.ones(out_channels, in_channels // groups, *self.kernel_size))
+
+        self.add_loss(lambda s: 0.5 * s.get_sampled_weights().pow(2).sum() / (w_prior_sigma ** 2))
+        self.add_loss(lambda s: -self.out_channels / 2 * np.log(2 * np.pi) - 0.5 * s.samples['w_noise_state'].pow(
+            2).sum() - self.log_weights_sigma.sum())
+
+        if self.has_bias:
+            self.bias_mean = Parameter((0.0 if init_bias_mean_zero else 1.0) * torch.rand(out_channels) - 0.5)
+            self.log_bias_sigma = Parameter(
+                torch.log(init_prior_sigma_scale * b_prior_sigma * torch.ones(out_channels)))
+            self.noise_source_bias = Normal(torch.zeros(out_channels), torch.ones(out_channels))
+
+            self.add_loss(lambda s: 0.5 * s.get_sampled_bias().pow(2).sum() / (b_prior_sigma ** 2))
+            self.add_loss(lambda s: -self.out_channels / 2 * np.log(2 * np.pi) - 0.5 * s.samples['b_noise_state'].pow(
+                2).sum() - self.log_bias_sigma.sum())
+
+    def sample_transform(self, stochastic=True):
+        self.samples['w_noise_state'] = self.noise_source_weights.sample().to(device=self.weights_mean.device)
+        self.sample['weights'] = self.weights_mean + (torch.exp(self.log_weights_sigma) * self.samples['w_noise_state']
+                                                      if stochastic else 0)
+
+        if self.has_bias:
+            self.samples['b_noise_state'] = self.noise_source_bias.sample().to(device=self.bias_mean.device)
+            self.samples['bias'] = self.bias_mean + (torch.exp(self.log_bias_sigma) * self.samples['b_noise_state']
+                                                     if stochastic else 0)
+
+    def get_sampled_weights(self):
+        return self.sample['weights']
+
+    def get_sampled_bias(self):
+        return self.sample['bias']
+
+    # noinspection PyTypeChecker
+    def forward(self, x, stochastic=True):
+        self.sample_transform(stochastic)
+
+        if self.padding != 0 and self.padding != (0, 0):
+            pad_kernel = (self.padding, self.padding, self.padding, self.padding) if isinstance(self.padding, int) else \
+                (self.padding[1], self.padding[1], self.padding[0], self.padding[0])
+            mx = F.pad(x, pad_kernel, mode=self.padding_mode, value=0)
+        else:
+            mx = x
+
+        return F.conv2d(mx, weight=self.samples['weights'], bias=self.samples['bias'] if self.has_bias else None,
+                        stride=self.stride, padding=0, dilation=self.dilation, groups=self.groups)
 
 
