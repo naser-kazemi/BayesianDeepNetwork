@@ -71,4 +71,41 @@ class MeanFieldGaussianFeedForward(VIModel):
         self.log_weights_sigma = Parameter(
             torch.log(
                 init_prior_sigma_scale * weight_prior_sigma * torch.ones(out_features, round(in_features / groups))))
-        self.noise_source_weights = Normal()
+        self.noise_source_weights = Normal(torch.zeros(out_features, round(in_features / groups)),
+                                           torch.ones(out_features, round(in_features / groups)))
+        self.add_loss(lambda s: 0.5 * s.get_sampled_weights().pow(2).sum() / (weight_prior_sigma ** 2))
+        self.add_loss(lambda s: -self.out_features / 2 * np.log(2 * np.pi) - 0.5 * s.samples['b_noise_state'].pow(
+            2).sum() - self.log_weights_sigma.sum())
+
+        if self.has_bias:
+            self.bias_mean = Parameter((0.0 if init_bias_mean_zero else 1.0) * torch.rand(out_features) - 0.5)
+            self.log_bias_sigma = Parameter(
+                torch.log(init_prior_sigma_scale * bias_prior_sigma * torch.ones(out_features)))
+
+            self.noise_source_bias = Normal(torch.zeros(out_features), torch.ones(out_features))
+
+            self.add_loss(lambda s: 0.5 * s.get_sampled_bias().pow(2).sum() / (bias_prior_sigma ** 2))
+            self.add_loss(lambda s: -self.out_features / 2 * np.log(2 * np.pi) - 0.5 * s.samples['b_noise_state'].pow(
+                2).sum() - self.log_bias_sigma.sum())
+
+    def sample_transform(self, stochastic=True):
+        self.samples['w_noise_state'] = self.noise_source_weights.sample().to(device=self.weights_mean.device)
+        self.samples['weights'] = self.weights_mean + (
+            torch.exp(self.log_weights_sigma) * self.samples['w_noise_state'] if stochastic else 0)
+
+        if self.has_bias:
+            self.samples['b_noise_state'] = self.noise_source_weights.sample().to(device=self.bias_mean.device)
+            self.samples['bias'] = self.bias_mean + (
+                torch.exp(self.log_bias_sigma) * self.samples['b_noise_state'] if stochastic else 0)
+
+    def get_sampled_weights(self):
+        return self.samples['weights']
+
+    def get_sampled_bias(self):
+        return self.samples['bias']
+
+    def forward(self, x, stochastic=True):
+        self.sample_transform(stochastic)
+        return F.linear(x, weight=self.samples['weights'], bias=self.samples['bias'] if self.has_bias else None)
+
+
