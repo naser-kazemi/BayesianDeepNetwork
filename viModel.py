@@ -50,8 +50,8 @@ class MeanFieldGaussianFeedForward(VIModel):
                  out_features,
                  bias=True,
                  groups=1,
-                 weight_prior_sigma=1,
-                 bias_prior_sigma=1,
+                 weight_prior_sigma=1.,
+                 bias_prior_sigma=1.,
                  init_mean_zero=False,
                  init_bias_mean_zero=False,
                  init_prior_sigma_scale=0.01
@@ -102,6 +102,7 @@ class MeanFieldGaussianFeedForward(VIModel):
     def get_sampled_bias(self):
         return self.samples['bias']
 
+    # noinspection PyTypeChecker
     def forward(self, x, stochastic=True):
         self.sample_transform(stochastic)
         return F.linear(x, weight=self.samples['weights'], bias=self.samples['bias'] if self.has_bias else None)
@@ -122,8 +123,8 @@ class MeanFieldGaussian2DConvolution(VIModel):
                  groups=1,
                  bias=True,
                  padding_mode='zeros',
-                 w_prior_sigma=1,
-                 b_prior_sigma=1,
+                 w_prior_sigma=1.,
+                 b_prior_sigma=1.,
                  init_mean_zero=False,
                  init_bias_mean_zero=False,
                  init_prior_sigma_scale=0.01):
@@ -194,3 +195,40 @@ class MeanFieldGaussian2DConvolution(VIModel):
                         stride=self.stride, padding=0, dilation=self.dilation, groups=self.groups)
 
 
+class BayesianMnistNet(VIModel):
+    def __init__(self,
+                 conv_w_prior_sigma=1.0,
+                 conv_b_prior_sigma=5.0,
+                 linear_w_prior_sigma=1.0,
+                 linear_b_prior_sigma=5.0,
+                 p_mc_dropout=0.5):
+        super().__init__()
+
+        self.p_mc_dropout = p_mc_dropout
+
+        self.conv1 = MeanFieldGaussian2DConvolution(1, 16, padding=1, w_prior_sigma=conv_w_prior_sigma,
+                                                    b_prior_sigma=conv_b_prior_sigma, kernel_size=5,
+                                                    init_prior_sigma_scale=1e-7)
+
+        self.conv2 = MeanFieldGaussian2DConvolution(16, 32, padding=1, w_prior_sigma=conv_w_prior_sigma,
+                                                    b_prior_sigma=conv_b_prior_sigma, kernel_size=5,
+                                                    init_prior_sigma_scale=1e-7)
+
+        self.linear1 = MeanFieldGaussianFeedForward(512, 128, weight_prior_sigma=linear_w_prior_sigma,
+                                                    bias_prior_sigma=linear_b_prior_sigma, init_prior_sigma_scale=1e-7)
+
+        self.linear2 = MeanFieldGaussianFeedForward(128, 10, weight_prior_sigma=linear_w_prior_sigma,
+                                                    bias_prior_sigma=linear_b_prior_sigma, init_prior_sigma_scale=1e-7)
+
+    def forward(self, x, stochastic=True):
+        x = F.relu(F.max_pool2d(self.conv1(x, stochastic=stochastic), 2))
+        x = self.conv2(x, stochastic)
+        if self.p_mc_dropout is not None:
+            x = F.dropout2d(x, p=self.p_mc_dropout, training=stochastic)
+        x = F.relu(F.max_pool2d(x, 2))
+        x = x.view(-1, 512)
+        x = F.relu(self.linear1(x, stochastic=stochastic))
+        if self.p_mc_dropout is not None:
+            x = F.dropout(x, p=self.p_mc_dropout, training=stochastic)
+        x = self.linear2(x, stochastic=stochastic)
+        return F.log_softmax(x, dim=1)
